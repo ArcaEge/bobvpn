@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     cmd("ip", &["addr", "add", "dev", iface.name(), "10.107.1.2/24"]);
     cmd("ip", &["link", "set", "up", "dev", iface.name()]);
     cmd("ip", &["link", "set", "dev", iface.name(), "mtu", "1280"]);
-    cmd("ip", &["route", "add", "default", "via", "10.107.1.2", "dev", iface.name()]);
+    cmd("ip", &["route", "add", "default", "via", "10.107.1.3", "dev", iface.name()]);
 
     println!(
         "Created interface {}. Send some packets into it and see they're printed here",

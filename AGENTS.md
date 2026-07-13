@@ -1,16 +1,16 @@
 # bobvpn — Agent Memory
 
 ## Objective
-Rust VPN-over-HTTPS binary that tunnels over port 443 with a camouflage static site, NM desktop integration, ACME or self-signed certs, HTTP streaming fallback when WebSocket is blocked, and builds cleanly.
+Rust VPN-over-HTTPS binary that tunnels over port 443 with a camouflage static site, NM desktop integration, ACME or self-signed certs, HTTP streaming fallback when WebSocket is blocked, builds cleanly, and can be cross-compiled for Windows clients.
 
 ## Structure
 ```
 src/
-  main.rs       — CLI (clap), TUN creation, sysctl/iptables, entry points
+  main.rs       — CLI (clap), TUN creation, platform-specific routing (client_net)
   config.rs     — constants (IPs, ports, intervals), CertMode enum, path helpers
   crypto.rs     — X25519 + HKDF key exchange, ChaCha20-Poly1305 AEAD, PSK load/generate
   tun.rs        — TunDevice wrapper (Arc<AsyncDevice}), Clone, recv_packet/send_packet
-  nm.rs         — NetworkManager integration via nmcli (best-effort, errors swallowed)
+  nm.rs         — Linux-only: NetworkManager integration via nmcli (guarded by #[cfg])
   web.rs        — Static file server for camouflage site
   tunnel/
     mod.rs      — Frame constants, encode/decode helpers
@@ -28,6 +28,7 @@ src/
 - TUN reader spawns increment a `write_counter` (u64) for AEAD nonces
 - Keepalive: separate tokio task writes `FRAME_KEEPALIVE` frames into shared mpsc channel
 - No comments in code unless required
+- Platform-specific code in `client_net` module inside `main.rs` with `#[cfg(target_os = "linux")]` / `#[cfg(target_os = "windows")]` on individual functions
 
 ## Networking
 - TUN subnet IPv4: `10.107.1.0/24`, server=`10.107.1.1`, client=`10.107.1.2`
@@ -43,6 +44,18 @@ src/
   - GET `/http/stream` — persistent HTTP stream, TUN reader per session encrypts frames → response body
   - Cleanup: stale sessions evicted after 90s inactivity
 
+## Windows client
+- Uses `tun-rs` which supports Windows via the Wintun driver
+- Requires Wintun driver installed (bundled with WireGuard, Tailscale, etc.)
+- Requires Administrator privileges (TUN device + route manipulation)
+- Routing on Windows uses PowerShell `Get-NetRoute`/`New-NetRoute`/`Remove-NetRoute`
+- Server IP pinning uses `route add <ip> mask 255.255.255.255 <gateway>`
+- IPv6 routing skipped on Windows (server has no IPv6 anyway)
+- `nm.rs` (NetworkManager) is Linux-only, guarded by `#[cfg(target_os = "linux")]`
+- Server mode is Linux-only (sysctl/iptables) — use `bobvpn server` only on Linux
+- Cross-compile from Linux: `cross build --target x86_64-pc-windows-msvc --release`
+- Or build natively on Windows: `cargo build --release` (requires Rust MSVC toolchain)
+
 ## Crypto
 - Auth: PSK (32B from file or auto-generated) + X25519 ephemeral → HKDF-SHA256 → AEAD key
 - Frame encryption: ChaCha20-Poly1305, nonce = `counter.to_le_bytes()` (zero-padded to 12 bytes)
@@ -51,12 +64,13 @@ src/
 
 ## Known state
 - All source files written, builds cleanly with zero warnings and zero clippy warnings
+- IPv6 ULA subnet `fd00:107:1::/64` implemented (TUN addr, ip6tables, routing, forwarding) but server has no global IPv6 address — Oracle VCN needs IPv6 enabled for internet-routable IPv6 traffic
 - No `.unwrap()` or `.expect()` calls in `src/` — all errors propagated via `anyhow` or logged
 - Both client and server send `FRAME_KEEPALIVE` every 30s via a dedicated tokio task
 - sysctl/iptables/ip-route failures logged as warnings instead of silently discarded
 - Docker tests pass: WS handshake + keepalive (`test_docker.sh`), HTTP fallback handshake + keepalive (`test_http_fallback.sh` with `--force-http`)
 - No CI configured
-- `nm::register_tun` returns `()` — errors internal (expected for headless/CI)
+- `nm::register_tun` returns `()` — errors internal (expected for headless/CI), only compiled on Linux
 
 ## Docker & Deployment
 - **Dockerfile must include `iptables` and `procps`** (for `sysctl`). Without them the container can't set MASQUERADE or FORWARD rules, breaking internet forwarding.

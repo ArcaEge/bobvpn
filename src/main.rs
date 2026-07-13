@@ -1,5 +1,6 @@
 mod config;
 mod crypto;
+#[cfg(target_os = "linux")]
 mod nm;
 mod tun;
 mod tunnel;
@@ -22,37 +23,23 @@ struct Cli {
 enum Commands {
     /// Start the server
     Server {
-        /// Domain for ACME/Let's Encrypt (omit for self-signed)
         #[arg(long)]
         domain: Option<String>,
-
-        /// Path to TLS certificate (self-signed mode)
         #[arg(long)]
         cert: Option<PathBuf>,
-
-        /// Path to TLS private key (self-signed mode)
         #[arg(long)]
         key: Option<PathBuf>,
-
-        /// Insecure: listen without TLS (plain WebSocket)
         #[arg(long, default_value_t = false)]
         insecure: bool,
-
-        /// Listen port (default: 8080 for --insecure, 443 for TLS)
         #[arg(long)]
         port: Option<u16>,
     },
     /// Start the client
     Client {
-        /// Server hostname or IP
         #[arg(long)]
         server: String,
-
-        /// Insecure: skip TLS certificate verification
         #[arg(long, default_value_t = false)]
         insecure: bool,
-
-        /// Force HTTP streaming fallback (skip WebSocket attempt)
         #[arg(long, default_value_t = false)]
         force_http: bool,
     },
@@ -68,6 +55,180 @@ fn cmd(cmd: &str, args: &[&str]) -> Result<()> {
     anyhow::ensure!(ecode.success(), "command failed: {} {:?}", cmd, args);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Platform-specific client network helpers
+// ---------------------------------------------------------------------------
+
+mod client_net {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    pub fn get_gateway() -> String {
+        String::from_utf8_lossy(
+            &Command::new("sh")
+                .args(["-c", "ip route show default | awk '{print $3}'"])
+                .output()
+                .map(|o| o.stdout)
+                .unwrap_or_default(),
+        )
+        .trim()
+        .to_string()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn get_gateway() -> String {
+        String::from_utf8_lossy(
+            &Command::new("powershell")
+                .args(["-Command",
+                    "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1).NextHop"])
+                .output()
+                .map(|o| o.stdout)
+                .unwrap_or_default(),
+        )
+        .trim()
+        .to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get_gateway_v6() -> String {
+        String::from_utf8_lossy(
+            &Command::new("sh")
+                .args(["-c", "ip -6 route show default | awk '{print $3}'"])
+                .output()
+                .map(|o| o.stdout)
+                .unwrap_or_default(),
+        )
+        .trim()
+        .to_string()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn get_gateway_v6() -> String {
+        String::new()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn pin_route(ip: &str, gw: &str) -> Result<()> {
+        cmd("ip", &["route", "replace", ip, "via", gw])
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn pin_route(ip: &str, gw: &str) -> Result<()> {
+        cmd("route", &["add", ip, "mask", "255.255.255.255", gw])
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn pin_route_v6(ip: &str, gw: &str) -> Result<()> {
+        cmd("ip", &["-6", "route", "replace", ip, "via", gw, "dev", "eth0"])
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn pin_route_v6(_ip: &str, _gw: &str) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn delete_default_routes() {
+        let _ = cmd("sh", &["-c", "while ip route del default 2>/dev/null; do :; done; true"]);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn delete_default_routes() {
+        let _ = cmd("powershell", &["-Command",
+            "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Remove-NetRoute -Confirm:$false"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn delete_default_routes_v6() {
+        let _ = cmd("sh", &["-c", "while ip -6 route del default 2>/dev/null; do :; done; true"]);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn delete_default_routes_v6() {}
+
+    #[cfg(target_os = "linux")]
+    pub fn set_default_route(gw: &str, tun: &str) -> Result<()> {
+        cmd("ip", &["route", "add", "default", "via", gw, "dev", tun])
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn set_default_route(gw: &str, tun: &str) -> Result<()> {
+        cmd("powershell", &["-Command", &format!(
+            "New-NetRoute -DestinationPrefix '0.0.0.0/0' -NextHop '{gw}' -InterfaceAlias '{tun}'"
+        )])
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_default_route_v6(gw: &str, tun: &str) -> Result<()> {
+        cmd("ip", &["-6", "route", "add", "default", "via", gw, "dev", tun])
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn set_default_route_v6(_gw: &str, _tun: &str) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn add_tun_ipv6(tun: &str) {
+        let _ = cmd("ip", &["-6", "addr", "add", &format!("{}/{}", config::CLIENT_IP_V6, config::TUN_PREFIX_V6), "dev", tun]);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn add_tun_ipv6(_tun: &str) {}
+
+    #[cfg(target_os = "linux")]
+    pub fn register_nm(tun: &str) {
+        crate::nm::register_tun(tun);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn register_nm(_tun: &str) {}
+}
+
+use client_net::*;
+
+// ---------------------------------------------------------------------------
+// Server helpers (Linux only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn setup_server_network(tun_name: &str) {
+    if let Err(e) = cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
+        log::warn!("failed to enable IP forwarding (may need root): {}", e);
+    }
+    let _ = cmd("sysctl", &["-w", "net.ipv4.conf.all.rp_filter=2"]);
+    let subnet = format!("{}/{}", config::TUN_SUBNET, config::TUN_PREFIX);
+    if let Err(e) = cmd(
+        "iptables",
+        &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet, "-j", "MASQUERADE"],
+    ) {
+        log::warn!("failed to add IPv4 NAT rule: {}", e);
+    }
+    let _ = cmd("iptables", &["-P", "FORWARD", "ACCEPT"]);
+    let _ = cmd("iptables", &["-A", "FORWARD", "-i", tun_name, "-j", "ACCEPT"]);
+    let _ = cmd("iptables", &["-A", "FORWARD", "-o", tun_name, "-j", "ACCEPT"]);
+
+    let _ = cmd("sysctl", &["-w", "net.ipv6.conf.all.forwarding=1"]);
+    let _ = cmd("ip", &["-6", "addr", "add", &format!("{}/{}", config::SERVER_IP_V6, config::TUN_PREFIX_V6), "dev", tun_name]);
+    let subnet_v6 = format!("{}/{}", config::TUN_SUBNET_V6, config::TUN_PREFIX_V6);
+    let _ = cmd("ip6tables", &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet_v6, "-j", "MASQUERADE"]);
+    let _ = cmd("ip6tables", &["-P", "FORWARD", "ACCEPT"]);
+    let _ = cmd("ip6tables", &["-A", "FORWARD", "-i", tun_name, "-j", "ACCEPT"]);
+    let _ = cmd("ip6tables", &["-A", "FORWARD", "-o", tun_name, "-j", "ACCEPT"]);
+
+    crate::nm::register_tun(tun_name);
+    log::info!("IPv4 + IPv6 forwarding enabled, NAT configured");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn setup_server_network(_tun_name: &str) {
+    log::warn!("server mode requires Linux for sysctl/iptables setup");
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -99,35 +260,7 @@ async fn main() -> Result<()> {
             log::info!("TUN device created: {}", tun_name);
             let tun = tun::TunDevice::new(tun_dev);
 
-            if let Err(e) = cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
-                log::warn!("failed to enable IP forwarding (may need root): {}", e);
-            }
-            let _ = cmd("sysctl", &["-w", "net.ipv4.conf.all.rp_filter=2"]);
-            let subnet = format!("{}/{}", config::TUN_SUBNET, config::TUN_PREFIX);
-            if let Err(e) = cmd(
-                "iptables",
-                &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet, "-j", "MASQUERADE"],
-            ) {
-                log::warn!("failed to add IPv4 NAT rule: {}", e);
-            }
-            let _ = cmd("iptables", &["-P", "FORWARD", "ACCEPT"]);
-            if let Err(e) = cmd("iptables", &["-A", "FORWARD", "-i", &tun_name, "-j", "ACCEPT"]) {
-                log::warn!("failed to add FORWARD rule for TUN input: {}", e);
-            }
-            if let Err(e) = cmd("iptables", &["-A", "FORWARD", "-o", &tun_name, "-j", "ACCEPT"]) {
-                log::warn!("failed to add FORWARD rule for TUN output: {}", e);
-            }
-
-            let _ = cmd("sysctl", &["-w", "net.ipv6.conf.all.forwarding=1"]);
-            let _ = cmd("ip", &["-6", "addr", "add", &format!("{}/{}", config::SERVER_IP_V6, config::TUN_PREFIX_V6), "dev", &tun_name]);
-            let subnet_v6 = format!("{}/{}", config::TUN_SUBNET_V6, config::TUN_PREFIX_V6);
-            let _ = cmd("ip6tables", &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet_v6, "-j", "MASQUERADE"]);
-            let _ = cmd("ip6tables", &["-P", "FORWARD", "ACCEPT"]);
-            let _ = cmd("ip6tables", &["-A", "FORWARD", "-i", &tun_name, "-j", "ACCEPT"]);
-            let _ = cmd("ip6tables", &["-A", "FORWARD", "-o", &tun_name, "-j", "ACCEPT"]);
-
-            nm::register_tun(&tun_name);
-            log::info!("IPv4 + IPv6 forwarding enabled, NAT configured");
+            setup_server_network(&tun_name);
 
             if insecure {
                 log::warn!("running without TLS (--insecure)");
@@ -166,58 +299,41 @@ async fn main() -> Result<()> {
 
             let tun = tun::TunDevice::new(tun_dev);
 
-            let _ = cmd("ip", &["-6", "addr", "add", &format!("{}/{}", config::CLIENT_IP_V6, config::TUN_PREFIX_V6), "dev", &tun_name]);
+            add_tun_ipv6(&tun_name);
 
             // Pin the VPN server via the current default gateway so the tunnel doesn't loop
-            let current_gw = String::from_utf8_lossy(
-                &Command::new("sh")
-                    .args(["-c", "ip route show default | awk '{print $3}'"])
-                    .output()
-                    .map(|o| o.stdout)
-                    .unwrap_or_default(),
-            )
-            .trim()
-            .to_string();
-            let current_gw_v6 = String::from_utf8_lossy(
-                &Command::new("sh")
-                    .args(["-c", "ip -6 route show default | awk '{print $3}'"])
-                    .output()
-                    .map(|o| o.stdout)
-                    .unwrap_or_default(),
-            )
-            .trim()
-            .to_string();
+            let current_gw = get_gateway();
+            let current_gw_v6 = get_gateway_v6();
             let server_addr = format!("{}:443", server);
             if let Ok(addrs) = tokio::net::lookup_host(&server_addr).await {
                 for addr in addrs {
                     if addr.is_ipv4() && !current_gw.is_empty() {
-                        let _ = cmd(
-                            "ip",
-                            &["route", "replace", &addr.ip().to_string(), "via", &current_gw],
-                        );
+                        if let Err(e) = pin_route(&addr.ip().to_string(), &current_gw) {
+                            log::warn!("failed to pin server route: {}", e);
+                        }
                     }
                     if addr.is_ipv6() && !current_gw_v6.is_empty() {
-                        let _ = cmd(
-                            "ip",
-                            &["-6", "route", "replace", &addr.ip().to_string(), "via", &current_gw_v6, "dev", "eth0"],
-                        );
+                        if let Err(e) = pin_route_v6(&addr.ip().to_string(), &current_gw_v6) {
+                            log::warn!("failed to pin server IPv6 route: {}", e);
+                        }
                     }
                 }
             }
 
             // Delete all existing default routes, then route through TUN
-            let _ = cmd("sh", &["-c", "while ip route del default 2>/dev/null; do :; done; true"]);
+            delete_default_routes();
+            delete_default_routes_v6();
+
             let gw = config::SERVER_IP.to_string();
-            if let Err(e) = cmd("ip", &["route", "add", "default", "via", &gw, "dev", &tun_name]) {
+            if let Err(e) = set_default_route(&gw, &tun_name) {
                 log::warn!("failed to set IPv4 default route: {}", e);
             }
-            let _ = cmd("sh", &["-c", "while ip -6 route del default 2>/dev/null; do :; done; true"]);
             let gw_v6 = config::SERVER_IP_V6.to_string();
-            if let Err(e) = cmd("ip", &["-6", "route", "add", "default", "via", &gw_v6, "dev", &tun_name]) {
+            if let Err(e) = set_default_route_v6(&gw_v6, &tun_name) {
                 log::warn!("failed to set IPv6 default route: {}", e);
             }
 
-            nm::register_tun(&tun_name);
+            register_nm(&tun_name);
 
             log::info!("current gateway: {}, v6 gateway: {}, server pin: {}, default route: via {} dev {}",
                 current_gw, current_gw_v6, server_addr, config::SERVER_IP, tun_name);

@@ -172,6 +172,7 @@ async fn run_ws_tunnel(
         loop {
             match tun_reader_tun.recv_packet(&mut buf).await {
                 Ok(len) if len > 0 => {
+                    log::debug!("TUN read {} bytes, first 20: {:02x?}", len, &buf[..len.min(20)]);
                     let packet = Bytes::copy_from_slice(&buf[..len]);
                     let encrypted = match crypto::encrypt(&shared_key, write_counter, &packet) {
                         Ok(v) => v,
@@ -246,6 +247,7 @@ async fn run_ws_tunnel(
                         tunnel::FRAME_DATA => {
                             match crypto::decrypt(&shared_key, read_counter, &payload) {
                                 Ok(plaintext) => {
+                                    log::debug!("WS recv DATA frame, writing {} bytes to TUN", plaintext.len());
                                     if let Err(e) = tun.send_packet(&plaintext).await {
                                         log::warn!("tun send error ({} bytes): {}", plaintext.len(), e);
                                     }

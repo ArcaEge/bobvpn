@@ -185,6 +185,8 @@ async fn main() -> Result<()> {
 
             nm::register_tun(&tun_name);
 
+            log::info!("current gateway: {}, server pin: {}, default route: via {} dev {}",
+                current_gw, server_addr, config::SERVER_IP, tun_name);
             log::info!("routes configured, connecting to tunnel...");
 
             if force_http {

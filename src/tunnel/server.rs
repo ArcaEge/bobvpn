@@ -258,7 +258,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<TunnelState>) {
                             match crypto::decrypt(&key, read_counter, &payload) {
                                 Ok(plaintext) => {
                                     if let Err(e) = state.tun.send_packet(&plaintext).await {
-                                        log::warn!("tun send error: {}", e);
+                                        log::warn!("tun send error ({} bytes): {}", plaintext.len(), e);
                                     }
                                     read_counter += 1;
                                 }

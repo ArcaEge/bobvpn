@@ -5,48 +5,45 @@ use std::process::Command;
 ///
 /// This is best-effort — if NM is not running it silently succeeds.
 pub fn register_tun(tun_name: &str) {
-    // Mark bobvpn interfaces as unmanaged so NM doesn't fight for IP/route ownership.
-    let _ = write_nm_unmanaged_conf();
-
-    // Create a temporary dummy NM connection so the TUN appears in the GUI.
+    let _ = std::fs::remove_file("/etc/NetworkManager/conf.d/90-bobvpn.conf");
     let uuid = uuid_v4_fallback();
+    let con_name = format!("bobvpn-{}", tun_name);
+
+    // Remove old connection if it exists from a previous run
+    let _ = Command::new("nmcli")
+        .args(["connection", "delete", &con_name])
+        .output();
+
     let _ = Command::new("nmcli")
         .args([
             "connection",
             "add",
             "type",
-            "tun",
+            "generic",
             "con-name",
-            &format!("bobvpn-{}", tun_name),
+            &con_name,
             "ifname",
             tun_name,
             "connection.uuid",
             &uuid,
-            "tun.mode",
-            "1",
-            "ipv4.method",
-            "disabled",
-            "ipv6.method",
-            "disabled",
             "connection.autoconnect",
             "no",
+            "ipv4.method",
+            "link-local",
+            "ipv6.method",
+            "link-local",
         ])
         .output();
 
-    // (optional) activate the connection so NM marks it as "connected"
-    let _ = Command::new("nmcli")
-        .args([
-            "connection",
-            "up",
-            &format!("bobvpn-{}", tun_name),
-        ])
+    let result = Command::new("nmcli")
+        .args(["connection", "up", &con_name])
         .output();
-}
-
-fn write_nm_unmanaged_conf() -> Result<(), std::io::Error> {
-    let path = "/etc/NetworkManager/conf.d/90-bobvpn.conf";
-    let content = "[keyfile]\nunmanaged-devices=interface-name:bob*\n";
-    std::fs::write(path, content)
+    if let Ok(out) = result {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.is_empty() {
+            log::warn!("nmcli up: {}", stderr.trim());
+        }
+    }
 }
 
 fn uuid_v4_fallback() -> String {

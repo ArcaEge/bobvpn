@@ -71,6 +71,7 @@ fn cmd(cmd: &str, args: &[&str]) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     env_logger::init();
     let cli = Cli::parse();
 
@@ -89,17 +90,29 @@ async fn main() -> Result<()> {
                     .unwrap_or(if insecure { config::DEV_PORT } else { config::SERVER_PORT })
             });
 
+            let tun_dev = DeviceBuilder::new()
+                .ipv4(config::SERVER_IP.to_string().as_str(), config::TUN_PREFIX, None)
+                .mtu(config::TUN_MTU)
+                .build_async()
+                .context("failed to create TUN device")?;
+            let tun_name = tun_dev.name()?;
+            log::info!("TUN device created: {}", tun_name);
+            let tun = tun::TunDevice::new(tun_dev);
+
+            if let Err(e) = cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
+                log::warn!("failed to enable IP forwarding (may need root): {}", e);
+            }
+            let nat_rule = format!("-s {}/{}", config::TUN_SUBNET, config::TUN_PREFIX);
+            if let Err(e) = cmd(
+                "iptables",
+                &["-t", "nat", "-A", "POSTROUTING", &nat_rule, "-j", "MASQUERADE"],
+            ) {
+                log::warn!("failed to add NAT rule (may need root): {}", e);
+            }
+            nm::register_tun(&tun_name);
+
             if insecure {
                 log::warn!("running without TLS (--insecure)");
-                let tun_dev = DeviceBuilder::new()
-                    .ipv4(config::SERVER_IP.to_string().as_str(), config::TUN_PREFIX, None)
-                    .mtu(config::TUN_MTU)
-                    .build_async()
-                    .context("failed to create TUN device")?;
-                let tun_name = tun_dev.name()?;
-                log::info!("TUN device created: {}", tun_name);
-                let tun = tun::TunDevice::new(tun_dev);
-                nm::register_tun(&tun_name);
                 tunnel::server::run_plain(tun, port).await?;
                 return Ok(());
             }
@@ -116,33 +129,6 @@ async fn main() -> Result<()> {
                     "server requires either --domain (ACME) or --cert and --key (self-signed)"
                 ),
             };
-
-            log::info!("starting bobvpn server");
-
-            let tun_dev = DeviceBuilder::new()
-                .ipv4(config::SERVER_IP.to_string().as_str(), config::TUN_PREFIX, None)
-                .mtu(config::TUN_MTU)
-                .build_async()
-                .context("failed to create TUN device")?;
-
-            let tun_name = tun_dev.name()?;
-            log::info!("TUN device created: {}", tun_name);
-
-            let tun = tun::TunDevice::new(tun_dev);
-
-            if let Err(e) = cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
-                log::warn!("failed to enable IP forwarding (may need root): {}", e);
-            }
-
-            let nat_rule = format!("-s {}/{}", config::TUN_SUBNET, config::TUN_PREFIX);
-            if let Err(e) = cmd(
-                "iptables",
-                &["-t", "nat", "-A", "POSTROUTING", &nat_rule, "-j", "MASQUERADE"],
-            ) {
-                log::warn!("failed to add NAT rule (may need root): {}", e);
-            }
-
-            nm::register_tun(&tun_name);
 
             log::info!("IP forwarding enabled, NAT configured");
 
@@ -162,9 +148,32 @@ async fn main() -> Result<()> {
 
             let tun = tun::TunDevice::new(tun_dev);
 
+            // Pin the VPN server via the current default gateway so the tunnel doesn't loop
+            let current_gw = String::from_utf8_lossy(
+                &Command::new("sh")
+                    .args(["-c", "ip route show default | awk '{print $3}'"])
+                    .output()
+                    .map(|o| o.stdout)
+                    .unwrap_or_default(),
+            )
+            .trim()
+            .to_string();
+            let server_addr = format!("{}:443", server);
+            if let Ok(addrs) = tokio::net::lookup_host(&server_addr).await {
+                for addr in addrs {
+                    if addr.is_ipv4() && !current_gw.is_empty() {
+                        let _ = cmd(
+                            "ip",
+                            &["route", "replace", &addr.ip().to_string(), "via", &current_gw],
+                        );
+                    }
+                }
+            }
+
+            // Replace default route to go through the TUN
             let gw = config::SERVER_IP.to_string();
-            if let Err(e) = cmd("ip", &["route", "add", "default", "via", &gw, "dev", &tun_name]) {
-                log::warn!("failed to add route (may need root): {}", e);
+            if let Err(e) = cmd("ip", &["route", "replace", "default", "via", &gw, "dev", &tun_name]) {
+                log::warn!("failed to set default route (may need root): {}", e);
             }
 
             nm::register_tun(&tun_name);

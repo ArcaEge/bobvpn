@@ -147,7 +147,7 @@ async fn send_handler(
             match crypto::decrypt(&session.key, session.read_counter, &payload) {
                 Ok(plaintext) => {
                     if let Err(e) = store.tun.send_packet(&plaintext).await {
-                        log::warn!("tun send error: {}", e);
+                        log::warn!("tun send error ({} bytes): {}", plaintext.len(), e);
                     }
                     session.read_counter += 1;
                 }

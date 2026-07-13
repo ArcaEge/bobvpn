@@ -247,7 +247,7 @@ async fn run_ws_tunnel(
                             match crypto::decrypt(&shared_key, read_counter, &payload) {
                                 Ok(plaintext) => {
                                     if let Err(e) = tun.send_packet(&plaintext).await {
-                                        log::warn!("tun send error: {}", e);
+                                        log::warn!("tun send error ({} bytes): {}", plaintext.len(), e);
                                     }
                                     read_counter += 1;
                                 }

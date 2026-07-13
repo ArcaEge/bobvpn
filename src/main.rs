@@ -177,9 +177,10 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Replace default route to go through the TUN
+            // Delete all existing default routes, then route through TUN
+            let _ = cmd("sh", &["-c", "while ip route del default 2>/dev/null; do :; done; true"]);
             let gw = config::SERVER_IP.to_string();
-            if let Err(e) = cmd("ip", &["route", "replace", "default", "via", &gw, "dev", &tun_name]) {
+            if let Err(e) = cmd("ip", &["route", "add", "default", "via", &gw, "dev", &tun_name]) {
                 log::warn!("failed to set default route (may need root): {}", e);
             }
 

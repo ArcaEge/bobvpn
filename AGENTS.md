@@ -53,8 +53,9 @@ src/
 - IPv6 routing skipped on Windows (server has no IPv6 anyway)
 - `nm.rs` (NetworkManager) is Linux-only, guarded by `#[cfg(target_os = "linux")]`
 - Server mode is Linux-only (sysctl/iptables) — use `bobvpn server` only on Linux
-- Cross-compile from Linux: `cross build --target x86_64-pc-windows-msvc --release`
+- Build via GitHub Actions: `.github/workflows/windows-build.yml` — builds on `windows-latest` runner, uploads artifact, creates GitHub release on tags (`v*`)
 - Or build natively on Windows: `cargo build --release` (requires Rust MSVC toolchain)
+- Cross-compile from Linux NOT supported (aws-lc-sys needs MSVC, not MinGW; no MSVC toolchain on Linux)
 
 ## Crypto
 - Auth: PSK (32B from file or auto-generated) + X25519 ephemeral → HKDF-SHA256 → AEAD key

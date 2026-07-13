@@ -1,90 +1,187 @@
-//! An example of reading from tun
-//!
-//! It creates a tun device, sets it up (using shell commands) for local use and then prints the
-//! raw data of the packets that arrive.
-//!
-//! You really do want better error handling than all these unwraps.
-extern crate tun_tap;
+mod config;
+mod crypto;
+mod nm;
+mod tun;
+mod tunnel;
+mod web;
 
-use std::{env, error::Error, process::Command};
-use tun_tap::{Iface, Mode};
-mod client;
-mod device;
-mod peer;
-mod server;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::process::Command;
+use tun_rs::DeviceBuilder;
 
-enum RunType {
-    Server(Iface),
-    Client(Iface, String),
+#[derive(Parser)]
+#[command(name = "bobvpn", about = "VPN over HTTPS on port 443")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-impl RunType {
-    fn run(&self) -> ! {
-        match self {
-            Self::Server(iface) => {
-                server::run(iface);
-            }
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the server
+    Server {
+        /// Domain for ACME/Let's Encrypt (omit for self-signed)
+        #[arg(long)]
+        domain: Option<String>,
 
-            Self::Client(iface, address) => {
-                cmd(
-                    "ip",
-                    &[
-                        "route",
-                        "add",
-                        "default",
-                        "via",
-                        "10.107.1.3",
-                        "dev",
-                        iface.name(),
-                    ],
-                );
+        /// Path to TLS certificate (self-signed mode)
+        #[arg(long)]
+        cert: Option<PathBuf>,
 
-                client::run(iface, address);
-            }
-        }
-    }
+        /// Path to TLS private key (self-signed mode)
+        #[arg(long)]
+        key: Option<PathBuf>,
+
+        /// Insecure: listen without TLS (plain WebSocket)
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
+
+        /// Listen port (default: 8080 for --insecure, 443 for TLS)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Start the client
+    Client {
+        /// Server hostname or IP
+        #[arg(long)]
+        server: String,
+
+        /// Insecure: skip TLS certificate verification
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
+
+        /// Force HTTP streaming fallback (skip WebSocket attempt)
+        #[arg(long, default_value_t = false)]
+        force_http: bool,
+    },
 }
 
-/// Run a shell command. Panic if it fails in any way.
-fn cmd(cmd: &str, args: &[&str]) {
+fn cmd(cmd: &str, args: &[&str]) -> Result<()> {
     let ecode = Command::new(cmd)
         .args(args)
         .spawn()
-        .unwrap()
+        .with_context(|| format!("failed to spawn: {}", cmd))?
         .wait()
-        .unwrap();
-    assert!(ecode.success(), "Failed to execute {}", cmd);
+        .with_context(|| format!("failed to wait: {}", cmd))?;
+    anyhow::ensure!(ecode.success(), "command failed: {} {:?}", cmd, args);
+    Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::init();
+    let cli = Cli::parse();
 
-    println!("args: {:?}", args);
+    match cli.command {
+        Commands::Server {
+            domain,
+            cert,
+            key,
+            insecure,
+            port,
+        } => {
+            let port = port.unwrap_or_else(|| {
+                std::env::var("PORT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(if insecure { config::DEV_PORT } else { config::SERVER_PORT })
+            });
 
-    // Create the tun interface.
-    let iface = Iface::new("tun%d", Mode::Tun).unwrap();
-    eprintln!("Iface: {:?}", iface);
+            if insecure {
+                log::warn!("running without TLS (--insecure)");
+                let tun_dev = DeviceBuilder::new()
+                    .ipv4(config::SERVER_IP.to_string().as_str(), config::TUN_PREFIX, None)
+                    .mtu(config::TUN_MTU)
+                    .build_async()
+                    .context("failed to create TUN device")?;
+                let tun_name = tun_dev.name()?;
+                log::info!("TUN device created: {}", tun_name);
+                let tun = tun::TunDevice::new(tun_dev);
+                nm::register_tun(&tun_name);
+                tunnel::server::run_plain(tun, port).await?;
+                return Ok(());
+            }
 
-    // Configure the local (kernel) endpoint.
-    cmd("ip", &["addr", "add", "dev", iface.name(), "10.107.1.2/24"]);
-    cmd("ip", &["link", "set", "up", "dev", iface.name()]);
-    cmd("ip", &["link", "set", "dev", iface.name(), "mtu", "1280"]);
+            let cert_mode = match (domain, cert, key) {
+                (Some(d), None, None) => config::CertMode::Acme { domain: d },
+                (None, Some(c), Some(k)) => {
+                    config::CertMode::SelfSigned {
+                        cert_path: c,
+                        key_path: k,
+                    }
+                }
+                _ => anyhow::bail!(
+                    "server requires either --domain (ACME) or --cert and --key (self-signed)"
+                ),
+            };
 
-    println!("Created interface {}", iface.name());
+            log::info!("starting bobvpn server");
 
-    let run_type = match args.get(1) {
-        Some(string) => match string.as_str() {
-            "client" => RunType::Client(
-                iface,
-                args.get(2)
-                    .expect("no address string")
-                    .clone(),
-            ),
-            "server" => RunType::Server(iface),
-            _ => panic!("idiot"),
-        },
-        _ => panic!("must specify client or server"),
-    };
+            let tun_dev = DeviceBuilder::new()
+                .ipv4(config::SERVER_IP.to_string().as_str(), config::TUN_PREFIX, None)
+                .mtu(config::TUN_MTU)
+                .build_async()
+                .context("failed to create TUN device")?;
 
-    run_type.run();
+            let tun_name = tun_dev.name()?;
+            log::info!("TUN device created: {}", tun_name);
+
+            let tun = tun::TunDevice::new(tun_dev);
+
+            if let Err(e) = cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
+                log::warn!("failed to enable IP forwarding (may need root): {}", e);
+            }
+
+            let nat_rule = format!("-s {}/{}", config::TUN_SUBNET, config::TUN_PREFIX);
+            if let Err(e) = cmd(
+                "iptables",
+                &["-t", "nat", "-A", "POSTROUTING", &nat_rule, "-j", "MASQUERADE"],
+            ) {
+                log::warn!("failed to add NAT rule (may need root): {}", e);
+            }
+
+            nm::register_tun(&tun_name);
+
+            log::info!("IP forwarding enabled, NAT configured");
+
+            tunnel::server::run(tun, cert_mode).await?;
+        }
+        Commands::Client { server, insecure, force_http } => {
+            log::info!("starting bobvpn client, server: {} (insecure: {})", server, insecure);
+
+            let tun_dev = DeviceBuilder::new()
+                .ipv4(config::CLIENT_IP.to_string().as_str(), config::TUN_PREFIX, None)
+                .mtu(config::TUN_MTU)
+                .build_async()
+                .context("failed to create TUN device")?;
+
+            let tun_name = tun_dev.name()?;
+            log::info!("TUN device created: {}", tun_name);
+
+            let tun = tun::TunDevice::new(tun_dev);
+
+            let gw = config::SERVER_IP.to_string();
+            if let Err(e) = cmd("ip", &["route", "add", "default", "via", &gw, "dev", &tun_name]) {
+                log::warn!("failed to add route (may need root): {}", e);
+            }
+
+            nm::register_tun(&tun_name);
+
+            log::info!("routes configured, connecting to tunnel...");
+
+            if force_http {
+                log::warn!("forcing HTTP fallback (--force-http)");
+                tunnel::client::run_http(tun, &server, insecure).await?;
+            } else if insecure {
+                log::warn!("skipping TLS, using plain WebSocket (--insecure)");
+                tunnel::client::run_insecure(tun, &server).await?;
+            } else {
+                tunnel::client::run(tun, &server).await?;
+            }
+        }
+    }
+
+    Ok(())
 }

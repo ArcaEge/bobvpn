@@ -30,7 +30,8 @@ src/
 - No comments in code unless required
 
 ## Networking
-- TUN subnet: `10.107.1.0/24`, server=`10.107.1.1`, client=`10.107.1.2`
+- TUN subnet IPv4: `10.107.1.0/24`, server=`10.107.1.1`, client=`10.107.1.2`
+- TUN subnet IPv6: `fd00:107:1::/64`, server=`fd00:107:1::1`, client=`fd00:107:1::2`
 - Server port: 443 with TLS, 8080 insecure (`--insecure` flag for both server & client)
 - Client `--insecure`: replaces `wss://` → `ws://` (plain WS, no TLS)
 - MTU: 1280, MAX_FRAME_SIZE: 1500

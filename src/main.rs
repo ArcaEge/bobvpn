@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
                 "iptables",
                 &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet, "-j", "MASQUERADE"],
             ) {
-                log::warn!("failed to add NAT rule (may need root): {}", e);
+                log::warn!("failed to add IPv4 NAT rule: {}", e);
             }
             let _ = cmd("iptables", &["-P", "FORWARD", "ACCEPT"]);
             if let Err(e) = cmd("iptables", &["-A", "FORWARD", "-i", &tun_name, "-j", "ACCEPT"]) {
@@ -117,7 +117,17 @@ async fn main() -> Result<()> {
             if let Err(e) = cmd("iptables", &["-A", "FORWARD", "-o", &tun_name, "-j", "ACCEPT"]) {
                 log::warn!("failed to add FORWARD rule for TUN output: {}", e);
             }
+
+            let _ = cmd("sysctl", &["-w", "net.ipv6.conf.all.forwarding=1"]);
+            let _ = cmd("ip", &["-6", "addr", "add", &format!("{}/{}", config::SERVER_IP_V6, config::TUN_PREFIX_V6), "dev", &tun_name]);
+            let subnet_v6 = format!("{}/{}", config::TUN_SUBNET_V6, config::TUN_PREFIX_V6);
+            let _ = cmd("ip6tables", &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet_v6, "-j", "MASQUERADE"]);
+            let _ = cmd("ip6tables", &["-P", "FORWARD", "ACCEPT"]);
+            let _ = cmd("ip6tables", &["-A", "FORWARD", "-i", &tun_name, "-j", "ACCEPT"]);
+            let _ = cmd("ip6tables", &["-A", "FORWARD", "-o", &tun_name, "-j", "ACCEPT"]);
+
             nm::register_tun(&tun_name);
+            log::info!("IPv4 + IPv6 forwarding enabled, NAT configured");
 
             if insecure {
                 log::warn!("running without TLS (--insecure)");
@@ -156,10 +166,21 @@ async fn main() -> Result<()> {
 
             let tun = tun::TunDevice::new(tun_dev);
 
+            let _ = cmd("ip", &["-6", "addr", "add", &format!("{}/{}", config::CLIENT_IP_V6, config::TUN_PREFIX_V6), "dev", &tun_name]);
+
             // Pin the VPN server via the current default gateway so the tunnel doesn't loop
             let current_gw = String::from_utf8_lossy(
                 &Command::new("sh")
                     .args(["-c", "ip route show default | awk '{print $3}'"])
+                    .output()
+                    .map(|o| o.stdout)
+                    .unwrap_or_default(),
+            )
+            .trim()
+            .to_string();
+            let current_gw_v6 = String::from_utf8_lossy(
+                &Command::new("sh")
+                    .args(["-c", "ip -6 route show default | awk '{print $3}'"])
                     .output()
                     .map(|o| o.stdout)
                     .unwrap_or_default(),
@@ -175,6 +196,12 @@ async fn main() -> Result<()> {
                             &["route", "replace", &addr.ip().to_string(), "via", &current_gw],
                         );
                     }
+                    if addr.is_ipv6() && !current_gw_v6.is_empty() {
+                        let _ = cmd(
+                            "ip",
+                            &["-6", "route", "replace", &addr.ip().to_string(), "via", &current_gw_v6, "dev", "eth0"],
+                        );
+                    }
                 }
             }
 
@@ -182,13 +209,18 @@ async fn main() -> Result<()> {
             let _ = cmd("sh", &["-c", "while ip route del default 2>/dev/null; do :; done; true"]);
             let gw = config::SERVER_IP.to_string();
             if let Err(e) = cmd("ip", &["route", "add", "default", "via", &gw, "dev", &tun_name]) {
-                log::warn!("failed to set default route (may need root): {}", e);
+                log::warn!("failed to set IPv4 default route: {}", e);
+            }
+            let _ = cmd("sh", &["-c", "while ip -6 route del default 2>/dev/null; do :; done; true"]);
+            let gw_v6 = config::SERVER_IP_V6.to_string();
+            if let Err(e) = cmd("ip", &["-6", "route", "add", "default", "via", &gw_v6, "dev", &tun_name]) {
+                log::warn!("failed to set IPv6 default route: {}", e);
             }
 
             nm::register_tun(&tun_name);
 
-            log::info!("current gateway: {}, server pin: {}, default route: via {} dev {}",
-                current_gw, server_addr, config::SERVER_IP, tun_name);
+            log::info!("current gateway: {}, v6 gateway: {}, server pin: {}, default route: via {} dev {}",
+                current_gw, current_gw_v6, server_addr, config::SERVER_IP, tun_name);
             log::info!("routes configured, connecting to tunnel...");
 
             if force_http {

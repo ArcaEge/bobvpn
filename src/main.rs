@@ -102,12 +102,19 @@ async fn main() -> Result<()> {
             if let Err(e) = cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
                 log::warn!("failed to enable IP forwarding (may need root): {}", e);
             }
+            let _ = cmd("sysctl", &["-w", "net.ipv4.conf.all.rp_filter=2"]);
             let nat_rule = format!("-s {}/{}", config::TUN_SUBNET, config::TUN_PREFIX);
             if let Err(e) = cmd(
                 "iptables",
                 &["-t", "nat", "-A", "POSTROUTING", &nat_rule, "-j", "MASQUERADE"],
             ) {
                 log::warn!("failed to add NAT rule (may need root): {}", e);
+            }
+            if let Err(e) = cmd("iptables", &["-A", "FORWARD", "-i", &tun_name, "-j", "ACCEPT"]) {
+                log::warn!("failed to add FORWARD rule for TUN input: {}", e);
+            }
+            if let Err(e) = cmd("iptables", &["-A", "FORWARD", "-o", &tun_name, "-j", "ACCEPT"]) {
+                log::warn!("failed to add FORWARD rule for TUN output: {}", e);
             }
             nm::register_tun(&tun_name);
 

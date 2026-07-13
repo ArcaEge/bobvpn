@@ -168,11 +168,11 @@ async fn run_ws_tunnel(
     let tun_reader_tun = tun.clone();
     let tun_reader = tokio::spawn(async move {
         let mut write_counter: u64 = 0;
-        let mut buf = vec![0u8; config::MAX_FRAME_SIZE + 4];
+        let mut buf = vec![0u8; config::MAX_FRAME_SIZE];
         loop {
             match tun_reader_tun.recv_packet(&mut buf).await {
-                Ok(len) if len >= 4 => {
-                    let packet = Bytes::copy_from_slice(&buf[4..len]);
+                Ok(len) if len > 0 => {
+                    let packet = Bytes::copy_from_slice(&buf[..len]);
                     let encrypted = match crypto::encrypt(&shared_key, write_counter, &packet) {
                         Ok(v) => v,
                         Err(e) => {

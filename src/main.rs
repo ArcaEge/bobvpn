@@ -103,10 +103,10 @@ async fn main() -> Result<()> {
                 log::warn!("failed to enable IP forwarding (may need root): {}", e);
             }
             let _ = cmd("sysctl", &["-w", "net.ipv4.conf.all.rp_filter=2"]);
-            let nat_rule = format!("-s {}/{}", config::TUN_SUBNET, config::TUN_PREFIX);
+            let subnet = format!("{}/{}", config::TUN_SUBNET, config::TUN_PREFIX);
             if let Err(e) = cmd(
                 "iptables",
-                &["-t", "nat", "-A", "POSTROUTING", &nat_rule, "-j", "MASQUERADE"],
+                &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet, "-j", "MASQUERADE"],
             ) {
                 log::warn!("failed to add NAT rule (may need root): {}", e);
             }

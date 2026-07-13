@@ -29,5 +29,8 @@ pub fn cert_cache_path() -> PathBuf {
 
 fn dirs() -> PathBuf {
     let custom = std::env::var("BOBVPN_HOME").ok().map(PathBuf::from);
-    custom.unwrap_or_else(|| PathBuf::from("/root/.bobvpn"))
+    custom.unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        PathBuf::from(home).join(".config").join("bobvpn")
+    })
 }

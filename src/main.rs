@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
             ) {
                 log::warn!("failed to add NAT rule (may need root): {}", e);
             }
+            let _ = cmd("iptables", &["-P", "FORWARD", "ACCEPT"]);
             if let Err(e) = cmd("iptables", &["-A", "FORWARD", "-i", &tun_name, "-j", "ACCEPT"]) {
                 log::warn!("failed to add FORWARD rule for TUN input: {}", e);
             }

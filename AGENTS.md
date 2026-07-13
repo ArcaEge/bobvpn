@@ -56,3 +56,11 @@ src/
 - Docker tests pass: WS handshake + keepalive (`test_docker.sh`), HTTP fallback handshake + keepalive (`test_http_fallback.sh` with `--force-http`)
 - No CI configured
 - `nm::register_tun` returns `()` — errors internal (expected for headless/CI)
+
+## Docker & Deployment
+- **Dockerfile must include `iptables` and `procps`** (for `sysctl`). Without them the container can't set MASQUERADE or FORWARD rules, breaking internet forwarding.
+- Compose must set `sysctls: net.ipv4.ip_forward=1` and `cap_add: [NET_ADMIN]` — Docker-level sysctls set before entrypoint runs, so `sysctl` is optional but `procps` provides it as fallback.
+- Production server runs with `--insecure` on port 8080 behind Traefik TLS termination.
+- Deployment: push to GitHub → [GitHub Action](https://github.com/arcaege/bobvpn/actions) builds and pushes `ghcr.io/arcaege/bobvpn:main` → Dokploy auto-deploys (`pull_policy: always`).
+- To view server logs: `ssh -i ~/Downloads/<key> ubuntu@<ip> "sudo docker logs compose-<name>-bobvpn-1 --tail 200"`
+- Debug checklist: check `docker logs` for `failed to spawn` (missing binaries), verify `iptables -t nat -L POSTROUTING`, check FORWARD policy, confirm `conntrack` is active.

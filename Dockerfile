@@ -6,7 +6,7 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates wget iproute2 && \
+    ca-certificates wget iproute2 iptables procps && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/bobvpn /usr/local/bin/bobvpn
 EXPOSE 8080

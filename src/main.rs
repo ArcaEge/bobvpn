@@ -110,7 +110,13 @@ mod client_net {
 
     #[cfg(target_os = "linux")]
     pub fn pin_route(ip: &str, gw: &str) -> Result<()> {
-        cmd("ip", &["route", "replace", ip, "via", gw])
+        let output = Command::new("ip").args(["route", "get", ip]).output()?;
+        let route_info = String::from_utf8_lossy(&output.stdout);
+        if route_info.contains("dev eth0") && !route_info.contains("via ") {
+            cmd("ip", &["route", "replace", ip, "dev", "eth0", "scope", "link"])
+        } else {
+            cmd("ip", &["route", "replace", ip, "via", gw])
+        }
     }
 
     #[cfg(target_os = "windows")]

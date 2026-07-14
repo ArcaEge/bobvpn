@@ -27,7 +27,7 @@ docker run -d --name bobvpn-server \
     --cap-add NET_ADMIN \
     --device /dev/net/tun \
     --network bobvpn-test-net \
-    -v "$SECRET_DIR/secret:/root/.bobvpn/secret:ro" \
+    -v "$SECRET_DIR/secret:/root/.config/bobvpn/secret:ro" \
     -e RUST_LOG=info \
     bobvpn-test \
     server --insecure
@@ -47,7 +47,7 @@ docker run -d --name bobvpn-client \
     --cap-add NET_ADMIN \
     --device /dev/net/tun \
     --network bobvpn-test-net \
-    -v "$SECRET_DIR/secret:/root/.bobvpn/secret:ro" \
+    -v "$SECRET_DIR/secret:/root/.config/bobvpn/secret:ro" \
     -e RUST_LOG=info \
     bobvpn-test \
     client --server bobvpn-server --insecure

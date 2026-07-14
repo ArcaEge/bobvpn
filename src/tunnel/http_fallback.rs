@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::config;
@@ -10,9 +11,85 @@ use crate::tunnel;
 
 #[derive(Clone)]
 pub struct HttpFallbackClient {
-    http_client: reqwest::Client,
-    base_url: String,
+    host: String,
+    port: u16,
     session_id: String,
+}
+
+async fn http_post(
+    host: &str,
+    port: u16,
+    path: &str,
+    body: &[u8],
+    session_id: Option<&str>,
+) -> Result<(u16, Bytes)> {
+    log::debug!("http_post: resolving {}:{}", host, port);
+    let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
+        .await?
+        .next()
+        .context("dns resolution failed")?;
+    log::debug!("http_post: connecting to {}", addr);
+    let mut stream = TcpStream::connect(addr).await?;
+    log::debug!("http_post: connected");
+
+    let content_length = body.len();
+    let mut request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n",
+        path, host, port, content_length
+    );
+    if let Some(sid) = session_id {
+        request.push_str(&format!("X-Session-Id: {}\r\n", sid));
+    }
+    request.push_str("Connection: close\r\n\r\n");
+
+    log::debug!("http_post: writing request ({} bytes)", request.len() + content_length);
+    stream.write_all(request.as_bytes()).await?;
+    if !body.is_empty() {
+        stream.write_all(body).await?;
+    }
+    stream.flush().await?;
+    log::debug!("http_post: request written, reading response");
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).await?;
+    log::debug!("http_post: status line: {}", status_line.trim());
+
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .context("invalid status line")?;
+
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).await?;
+        if header == "\r\n" || header == "\n" {
+            break;
+        }
+        if header.to_lowercase().starts_with("content-length:") {
+            if let Some(len) = header.split(':').nth(1).and_then(|v| v.trim().parse::<usize>().ok()) {
+                content_length = Some(len);
+            }
+        }
+    }
+
+    let body_buf = match content_length {
+        Some(len) => {
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).await?;
+            buf
+        }
+        None => {
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf).await?;
+            buf
+        }
+    };
+    log::debug!("http_post: read {} bytes response body", body_buf.len());
+
+    Ok((status_code, Bytes::from(body_buf)))
 }
 
 impl HttpFallbackClient {
@@ -20,29 +97,21 @@ impl HttpFallbackClient {
         server_hostname: &str,
         port: u16,
         psk_hash: &[u8; 32],
-        insecure: bool,
+        _insecure: bool,
     ) -> Result<(Self, [u8; 32])> {
-        let scheme = if insecure { "http" } else { "https" };
-        let base_url = format!("{}://{}:{}", scheme, server_hostname, port);
-
-        let http_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(insecure)
-            .build()?;
-
         let mut handshake = crypto::Handshake::new();
         let auth_payload = crypto::build_auth_payload(&handshake, psk_hash);
         let auth_frame = tunnel::encode(tunnel::FRAME_AUTH, &auth_payload)?;
 
-        let resp = http_client
-            .post(format!("{}/http/init", base_url))
-            .body(auth_frame.to_vec())
-            .send()
-            .await
-            .context("http init request failed")?;
+        let (status, resp_bytes) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            http_post(server_hostname, port, "/http/init", &auth_frame, None),
+        )
+        .await
+        .context("http init request timed out")?
+        .context("http init request failed")?;
 
-        let status = resp.status();
-        let resp_bytes = resp.bytes().await?;
-        anyhow::ensure!(status.is_success(), "http init rejected: {}", status);
+        anyhow::ensure!(status == 200, "http init rejected: {}", status);
 
         let session_id = std::str::from_utf8(&resp_bytes[..36])
             .context("invalid session id")?
@@ -64,19 +133,19 @@ impl HttpFallbackClient {
         let shared_key = handshake.derive_key(&peer_pub)?;
 
         log::info!("http fallback handshake complete");
-        Ok((Self { http_client, base_url, session_id }, shared_key))
+        Ok((Self { host: server_hostname.to_string(), port, session_id }, shared_key))
     }
 
     pub async fn send_frame(&self, frame: &[u8]) -> Result<()> {
-        let resp = self
-            .http_client
-            .post(format!("{}/http/send", self.base_url))
-            .header("X-Session-Id", &self.session_id)
-            .body(frame.to_vec())
-            .send()
-            .await?;
-        let status = resp.status();
-        anyhow::ensure!(status.is_success(), "http send rejected: {}", status);
+        let (status, _) = http_post(
+            &self.host,
+            self.port,
+            "/http/send",
+            frame,
+            Some(&self.session_id),
+        )
+        .await?;
+        anyhow::ensure!(status == 200, "http send rejected: {}", status);
         Ok(())
     }
 
@@ -84,33 +153,64 @@ impl HttpFallbackClient {
         &self,
         frame_tx: mpsc::UnboundedSender<(u8, Bytes)>,
     ) -> Result<()> {
-        let resp = self
-            .http_client
-            .get(format!("{}/http/stream", self.base_url))
-            .header("X-Session-Id", &self.session_id)
-            .send()
-            .await?;
+        let addr = tokio::net::lookup_host(format!("{}:{}", self.host, self.port))
+            .await?
+            .next()
+            .context("dns resolution failed")?;
+        let stream = TcpStream::connect(addr).await?;
 
-        anyhow::ensure!(
-            resp.status().is_success(),
-            "http stream rejected: {}",
-            resp.status()
+        let request = format!(
+            "GET /http/stream HTTP/1.1\r\nHost: {}:{}\r\nX-Session-Id: {}\r\n\r\n",
+            self.host, self.port, self.session_id
         );
+        let (reader_half, mut writer_half) = stream.into_split();
+        writer_half.write_all(request.as_bytes()).await?;
+        writer_half.flush().await?;
 
-        let mut stream = resp.bytes_stream();
-        let mut buf = BytesMut::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buf.extend_from_slice(&chunk);
-            while let Some((frame_type, payload)) = tunnel::decode(&mut buf)? {
-                if frame_tx.send((frame_type, payload)).is_err() {
-                    return Ok(());
-                }
+        let mut reader = BufReader::new(reader_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        if !line.starts_with("HTTP/1.1 200") {
+            anyhow::bail!("stream rejected: {}", line.trim());
+        }
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await?;
+            if line == "\r\n" || line == "\n" {
+                break;
             }
         }
 
-        Ok(())
+        // Read raw length-prefixed frames from response body
+        // Frame format: 2 bytes length (big-endian) + 1 byte type + payload
+        let mut buf = BytesMut::new();
+        loop {
+            // Read frame length (2 bytes, big-endian)
+            while buf.len() < 2 {
+                let n = reader.read_buf(&mut buf).await?;
+                if n == 0 {
+                    return Ok(()); // EOF
+                }
+            }
+            let frame_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+            
+            // Read frame type (1 byte) + payload
+            let total_needed = 2 + 1 + frame_len;
+            while buf.len() < total_needed {
+                let n = reader.read_buf(&mut buf).await?;
+                if n == 0 {
+                    return Ok(()); // EOF
+                }
+            }
+            
+            let frame_type = buf[2];
+            let payload = buf[3..total_needed].to_vec().into();
+            let _ = buf.split_off(total_needed);
+
+            if frame_tx.send((frame_type, payload)).is_err() {
+                return Ok(());
+            }
+        }
     }
 }
 

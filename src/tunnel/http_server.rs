@@ -15,6 +15,7 @@ use futures_util::StreamExt;
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
+use crate::config;
 use crate::crypto;
 use crate::tun::TunDevice;
 use crate::tunnel;
@@ -24,7 +25,9 @@ const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 struct HttpSession {
     key: [u8; 32],
     read_counter: u64,
+    write_counter: u64,
     last_seen: Instant,
+    stream_sender: Option<mpsc::UnboundedSender<Bytes>>,
 }
 
 pub struct HttpSessionStore {
@@ -54,6 +57,48 @@ impl HttpSessionStore {
                     }
                     keep
                 });
+            }
+        });
+
+        let reader_store = store.clone();
+        let tun = reader_store.tun.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; crate::config::MAX_FRAME_SIZE];
+            loop {
+                match tun.recv_packet(&mut buf).await {
+                    Ok(len) if len > 0 => {
+                        let packet = Bytes::copy_from_slice(&buf[..len]);
+                        log::debug!("http tun reader: got {} bytes from TUN", len);
+                        let mut sessions = reader_store.sessions.lock().await;
+                        for (session_id, session) in sessions.iter_mut() {
+                            if let Some(sender) = &session.stream_sender {
+                                let encrypted = match crypto::encrypt(&session.key, session.write_counter, &packet) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        log::warn!("encrypt error for session {}: {}", session_id, e);
+                                        continue;
+                                    }
+                                };
+                                session.write_counter += 1;
+                                match tunnel::encode(tunnel::FRAME_DATA, &encrypted) {
+                                    Ok(frame) => {
+                                        let frame_len = frame.len();
+                                        log::debug!("stream: sending frame {} bytes to session {}", frame_len, session_id);
+                                        if sender.send(frame).is_err() {
+                                            log::debug!("stream sender closed for session {}", session_id);
+                                        }
+                                    }
+                                    Err(e) => log::warn!("encode error: {}", e),
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::error!("tun read error: {}", e);
+                        break;
+                    }
+                }
             }
         });
 
@@ -102,7 +147,9 @@ async fn do_init(store: &HttpSessionStore, body: &[u8]) -> Result<Vec<u8>> {
             HttpSession {
                 key,
                 read_counter: 0,
+                write_counter: 0,
                 last_seen: Instant::now(),
+                stream_sender: None,
             },
         );
     }
@@ -175,7 +222,7 @@ async fn stream_handler(
         }
     };
 
-    let key = {
+    let _key = {
         let mut sessions = store.sessions.lock().await;
         let session = match sessions.get_mut(&session_id) {
             Some(s) => s,
@@ -185,42 +232,34 @@ async fn stream_handler(
         session.key
     };
 
+    // Create a channel for this stream's frames
     let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Bytes>();
 
-    let tun = store.tun.clone();
-    let _tun_reader = tokio::spawn(async move {
-        let mut write_counter: u64 = 0;
-        let mut buf = vec![0u8; crate::config::MAX_FRAME_SIZE];
+    // Clone sender for keepalive task before registering
+    let keepalive_tx = frame_tx.clone();
+
+    // Register sender with session
+    {
+        let mut sessions = store.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.stream_sender = Some(frame_tx);
+        }
+    }
+
+    // Spawn keepalive task for this stream
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(config::KEEPALIVE_INTERVAL);
         loop {
-            match tun.recv_packet(&mut buf).await {
-                Ok(len) if len > 0 => {
-                    let packet = Bytes::copy_from_slice(&buf[..len]);
-                    let encrypted = match crypto::encrypt(&key, write_counter, &packet) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            log::warn!("encrypt error: {}", e);
-                            break;
-                        }
-                    };
-                    write_counter += 1;
-                    match tunnel::encode(tunnel::FRAME_DATA, &encrypted) {
-                        Ok(frame) => {
-                            if frame_tx.send(frame).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => log::warn!("encode error: {}", e),
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("tun read error: {}", e);
+            interval.tick().await;
+            if let Ok(frame) = tunnel::encode(tunnel::FRAME_KEEPALIVE, &[]) {
+                if keepalive_tx.send(frame).is_err() {
                     break;
                 }
             }
         }
-    });
-
+});
+    
+    // Stream raw frames directly (no HTTP chunked encoding)
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(frame_rx)
         .map(Ok::<_, std::convert::Infallible>);
 
@@ -229,6 +268,7 @@ async fn stream_handler(
         [
             ("Content-Type", "application/octet-stream"),
             ("Cache-Control", "no-cache"),
+            ("Connection", "close"),
         ],
         axum::body::Body::from_stream(stream),
     )
